@@ -1,1 +1,4 @@
+discord.py
+jaconv
+python-dotenv
 
