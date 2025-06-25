@@ -33,25 +33,21 @@ sheet4 = sheet.worksheet("シート4")
 sheet5 = sheet.worksheet("シート5")
 sheet6 = sheet.worksheet("シート6")
 
-def clear_except_header(worksheet):
-    num_rows = len(worksheet.get_all_values())
-    if num_rows > 1:
-        worksheet.batch_clear([f"A2:Z{num_rows}"])
-
-def clear_target_sheets_except_header():
-    for ws in [sheet1, sheet2, sheet3, sheet4]:
-        clear_except_header(ws)
+JST = timezone(timedelta(hours=9))
 
 @bot.command()
 async def search(ctx, start_date: str, end_date: str):
+    # コマンド開始メッセージを送信
     await ctx.send("🔍 データ検索を開始します…")
-    clear_target_sheets_except_header()
 
+    # メッセージを収集するチャンネルID一覧
     channel_ids = [1342103011396288512, 1309142327062954005]
-    start = datetime.strptime(start_date, "%Y/%m/%d").replace(tzinfo=JST)
-    end = datetime.strptime(end_date, "%Y/%m/%d").replace(tzinfo=JST) + timedelta(days=1)
 
-    # 総メッセージ数の事前カウント
+    # 開始日と終了日を JST タイムゾーン付きで datetime に変換
+    start = datetime.strptime(start_date, "%Y/%m/%d").replace(tzinfo=JST)
+    end = datetime.strptime(end_date, "%Y/%m/%d").replace(tzinfo=JST) + timedelta(days=1)  # 終了日は翌日0時まで含める
+
+    # 進捗報告用に総メッセージ数を事前カウント
     total_messages = 0
     for channel_id in channel_ids:
         channel = bot.get_channel(channel_id)
@@ -64,10 +60,13 @@ async def search(ctx, start_date: str, end_date: str):
 
     user_map = {}
     record_data = []
-    pay_data = {}
-    count_data = {}
-    rate_data = {}
 
+    # シート2への追記
+    existing_data = sheet2.get_all_values()
+    sheet2_header = existing_data[0] if existing_data else ['日付', '犯罪の種類', '犯罪カテゴリ', '参加者', '検挙']
+    new_rows = []
+
+    # 犯罪名のエイリアス定義（メッセージ中のキーワードから正式名に変換）
     CRIME_ALIASES = {
         "コンビニ強盗": ["コンビニ"],
         "フリーカ強盗": ["フリーカ"],
@@ -82,27 +81,32 @@ async def search(ctx, start_date: str, end_date: str):
         "ユニオン強盗": ["ユニオン"],
     }
 
+    # 犯罪カテゴリの分類（小型・中型・大型）
     crime_categories = {
         "小型強盗": {"コンビニ強盗", "フリーカ強盗", "モーテル強盗"},
         "中型強盗": {"客船強盗", "空港強盗", "トレイン強盗", "コンテナ強盗", "ボブキャット強盗","オイルリグ強盗"},
         "大型強盗": {"アーティファクト強盗", "ユニオン強盗"},
     }
 
+    # 小型強盗の報酬額（成功：100万、失敗：50万）
     reward_table = {
-        "コンビニ強盗": 200000,
-        "フリーカ強盗": 200000,
-        "モーテル強盗": 500000
+        "コンビニ強盗": 1000000,
+        "フリーカ強盗": 1000000,
+        "モーテル強盗": 1000000
     }
 
+    # メッセージから犯罪名を抽出する関数
     def extract_crime_type(content):
         for official_name, aliases in CRIME_ALIASES.items():
             if any(alias in content for alias in aliases):
                 return official_name
         return None
 
+    # 進捗報告の頻度を設定（10回ごと、または最後）
     processed = 0
     progress_update_interval = max(total_messages // 10, 1)
 
+    # 指定チャンネルのメッセージを1件ずつ処理
     for channel_id in channel_ids:
         channel = bot.get_channel(channel_id)
         if not channel:
@@ -110,21 +114,27 @@ async def search(ctx, start_date: str, end_date: str):
 
         async for message in channel.history(after=start, before=end, limit=None):
             processed += 1
+
+            # 一定間隔で進捗を表示
             if processed % progress_update_interval == 0 or processed == total_messages:
                 percent = int(processed / total_messages * 100)
                 await ctx.send(f"🔄 処理中... {percent}% 完了 ({processed}/{total_messages})")
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.2)  # 負荷軽減
 
+            # 犯罪名を抽出できない場合スキップ
             crime_type = extract_crime_type(message.content)
             if not crime_type:
                 continue
 
+            # 日付と初期情報の取得
             timestamp = get_timestamp_jst(message)
             participants = []
             results = set()
 
             guild = ctx.guild
+
+            # リアクションから参加者と結果（⭕/❌）を抽出
             for reaction in message.reactions:
                 if reaction.emoji in ["✅", "⭕", "❌"]:
                     async for user in reaction.users(limit=None):
@@ -132,383 +142,417 @@ async def search(ctx, start_date: str, end_date: str):
                         if user.bot:
                             continue
                         try:
-                            member = guild.get_member(user.id)
-                            if member is None:
-                                member = await guild.fetch_member(user.id)
+                            member = guild.get_member(user.id) or await guild.fetch_member(user.id)
                             display_name = member.display_name
                         except discord.NotFound:
                             display_name = user.name
+
                         user_map[user.id] = display_name
+
                         if reaction.emoji == "✅":
                             participants.append(user.id)
                         elif reaction.emoji in ["⭕", "❌"]:
                             results.add(reaction.emoji)
 
+            # 成功・失敗のリアクションが混在していたらスキップ
             if len(results) != 1:
                 continue
-            result = list(results)[0]
 
+            result = list(results)[0]  # "⭕" or "❌"
             category = next((k for k, v in crime_categories.items() if crime_type in v), "")
             names = [user_map.get(uid, str(uid)) for uid in participants]
+
+            # シート2用データ記録
             record_data.append([timestamp, crime_type, category, ",".join(names), result])
 
-            if category == "小型強盗":
-                for uid in participants:
-                    reward = reward_table.get(crime_type, 0) if result == "⭕" else 100000
-                    pay_data[uid] = pay_data.get(uid, 0) + reward
+    # --- ユーザー情報更新（シート1） ---
+    sheet1_values = sheet1.get_all_values()
+    existing_users = sheet1_values[1:]  # ヘッダーを除く
+    header1 = sheet1_values[0] if sheet1_values else ['ディスプレイネーム', 'ユーザーID']
+    user_id_to_name = {row[1]: row[0] for row in existing_users}  # {user_id: name}
 
-            for uid in participants:
-                if uid not in count_data:
-                    count_data[uid] = {
-                        "name": user_map.get(uid, str(uid)),
-                        "s_count": 0, "s_win": 0,
-                        "m_count": 0, "m_win": 0
-                    }
-                if category == "小型強盗":
-                    count_data[uid]["s_count"] += 1
-                    if result == "⭕":
-                        count_data[uid]["s_win"] += 1
-                else:
-                    count_data[uid]["m_count"] += 1
-                    if result == "⭕":
-                        count_data[uid]["m_win"] += 1
+    updated_sheet1_data = [header1] + existing_users.copy()
 
-            if crime_type not in rate_data:
-                rate_data[crime_type] = {"category": category, "total": 0, "win": 0}
-            rate_data[crime_type]["total"] += 1
-            if result == "⭕":
-                rate_data[crime_type]["win"] += 1
+    for user_id, name in user_map.items():
+        user_id_str = str(user_id)
+        if user_id_str in user_id_to_name:
+            if user_id_to_name[user_id_str] != name:
+                # 名前変更あり → 更新
+                for row in updated_sheet1_data:
+                    if row[1] == user_id_str:
+                        row[0] = name
+                        break
+        else:
+            # 新規ユーザー → 追加
+            updated_sheet1_data.append([name, user_id_str])
 
-    # Google Sheets 出力
-    sheet1.update([['ディスプレイネーム', 'ユーザーID']] + [[v, k] for k, v in user_map.items()])
-    sheet2.update([['日付', '犯罪の種類', '犯罪カテゴリ', '参加者', '検挙']] + record_data)
-    sheet3.update([['名前', '金額']] + [[user_map.get(uid, str(uid)), amount] for uid, amount in pay_data.items()])
+    sheet1.clear()
+    sheet1.update(updated_sheet1_data, 'A1')
 
-    sheet4_data = [['名前', '小型対応件数', '小型検挙数', '中型以上対応件数', '中型以上検挙数', 'チケット枚数']]
-    for uid, data in count_data.items():
-        ticket = data['s_count'] // 20 + data['m_count'] // 10
-        sheet4_data.append([data['name'], data['s_count'], data['s_win'], data['m_count'], data['m_win'], ticket])
-    sheet4.update(sheet4_data)
+    # --- ログデータ更新（シート2） ---
+    existing_data2 = sheet2.get_all_values()[1:]  # ヘッダー除く
+    header2 = sheet2.row_values(1)
+    sheet2.update([header2] + existing_data2 + record_data, 'A1')
 
-    period = f"{start.strftime('%Y/%m/%d')}~{(end - timedelta(days=1)).strftime('%Y/%m/%d')}"
-    sheet6_data = [['期間', '犯罪の種類', '犯罪カテゴリ', '事件数', '検挙数', '勝率']]
-    for crime, stats in rate_data.items():
-        win_rate = round((stats['win'] / stats['total']) * 100, 1) if stats['total'] > 0 else 0
-        sheet6_data.append([period, crime, stats['category'], stats['total'], stats['win'], f"{win_rate}%"])
-    sheet6.append_rows(sheet6_data[1:])
-
+    # 処理完了通知
     await ctx.send("✅ データ処理が完了しました！")
 
 @bot.command()
-async def calculate(ctx):
-    """シート3の報酬一覧をDiscordに出力する。"""
-    await ctx.send("✅ 報酬の集計を開始します...")
+async def calculate(ctx, start_date: str, end_date: str):
+    await ctx.send("💰 calculate 処理を開始します...")
 
-    data = sheet3.get_all_values()
-    if len(data) <= 1:
-        await ctx.send("⚠️ シート3にデータがありません。")
-        return
+    # シートの準備
+    sheet3.clear()
+    sheet3.update([['名前', '金額']],'A1')
+    sheet2_data = sheet2.get_all_values()[1:]  # ヘッダー除外
 
-    rows = data[1:]
-    for row in rows:
-        if len(row) < 2:
+    # 日付範囲をパース
+    start = datetime.strptime(start_date, "%Y/%m/%d").replace(tzinfo=JST)
+    end = datetime.strptime(end_date, "%Y/%m/%d").replace(tzinfo=JST)
+
+    reward_table = {
+        "コンビニ強盗": 1000000,
+        "フリーカ強盗": 1000000,
+        "モーテル強盗": 1000000
+    }
+
+    reward_data = {}
+
+    for row in sheet2_data:
+        try:
+            time_str, crime_type, category, participants_str, result = row
+        except ValueError:
+            continue  # 行に不備がある場合はスキップ
+
+        timestamp = datetime.strptime(time_str, "%Y/%m/%d %H:%M").replace(tzinfo=JST)
+        if not (start <= timestamp <= end):
             continue
-        name, amount = row[0], row[1]
-        await ctx.send(f"{name}：{amount}円")
 
-    await ctx.send("✅ 報酬の出力が完了しました。")
+        if category != "小型強盗":
+            continue
+
+        participants = participants_str.split(",")
+        for name in participants:
+            if result == "⭕":
+                reward = reward_table.get(crime_type, 500000)
+            else:
+                reward = 500000
+            reward_data[name] = reward_data.get(name, 0) + reward
+
+    output_rows = [[name, amount] for name, amount in reward_data.items()]
+    if output_rows:
+        sheet3.append_rows(output_rows)
+        for name, amount in reward_data.items():
+            await ctx.send(f"{name}：{amount:,} 円")
+    else:
+        await ctx.send("⚠️ 対象期間内に該当する小型強盗データがありません。")
+
+    await ctx.send("✅ calculate 処理が完了しました！")
 
 @bot.command()
-async def count(ctx):
-    """シート4の対応件数をDiscordにまとめて1メッセージで出力する"""
-    await ctx.send("✅ 対応件数の集計を開始します...")
+async def count(ctx, *args):
+    await ctx.send("📊 count 処理を開始します...")
 
-    sh = client.open_by_key("11MGwxoUOk2esCf-akJo2d3kSlLhV1rXsTwphuPn-HGI")
-    worksheet = sh.worksheet("シート4")
-
-    data = worksheet.get_all_values()
-    if len(data) <= 1:
-        await ctx.send("⚠️ シート4にデータがありません。")
+    # 引数の解析
+    if len(args) == 2:
+        user_filter = None
+        start_date, end_date = args
+    elif len(args) == 3:
+        user_filter = args[0]
+        start_date, end_date = args[1], args[2]
+    else:
+        await ctx.send("⚠️ 引数の形式が正しくありません。\n`!count [user_id] yyyy/mm/dd yyyy/mm/dd` の形式で入力してください。")
         return
 
-    rows = data[1:]  # ヘッダーを除く
+    # シート1からユーザーID→表示名のマップを作成
+    user_id_map = {row[1]: row[0] for row in sheet1.get_all_values()[1:]}
 
-    msg_list = []
+    # シート4をクリア
+    sheet4.clear()
+    sheet4.update([["名前", "小型対応件数", "小型検挙数", "中型以上対応件数", "中型以上検挙数", "チケット枚数"]], 'A1')
+
+    # シート2取得
+    rows = sheet2.get_all_values()[1:]  # ヘッダー除く
+    start = datetime.strptime(start_date, "%Y/%m/%d").replace(tzinfo=JST)
+    end = datetime.strptime(end_date, "%Y/%m/%d").replace(tzinfo=JST) + timedelta(days=1) - timedelta(minutes=1)
+
+    stats = {}
+
     for row in rows:
-        if len(row) < 6:
+        try:
+            time_str, crime_type, category, participants_str, result = row
+        except ValueError:
             continue
 
-        name = row[0]
-        small_count = row[1]
-        medium_large_count = row[3]
-        ticket_count = row[5]
-
-        # 件数が空の場合は0にする
-        try:
-            small_count_int = int(small_count)
-        except:
-            small_count_int = 0
-        try:
-            medium_large_count_int = int(medium_large_count)
-        except:
-            medium_large_count_int = 0
-        try:
-            ticket_count_int = int(ticket_count)
-        except:
-            ticket_count_int = 0
-
-        msg_list.append(
-            f"◯ {name}\n　小型：{small_count_int}件\n　中型以上：{medium_large_count_int}件\n　チケット：{ticket_count_int}枚"
-        )
-
-    # 2000文字を超える場合は分割して送信
-    MAX_LEN = 2000
-    chunk = ""
-    for line in msg_list:
-        if len(chunk) + len(line) + 1 > MAX_LEN:
-            await ctx.send(chunk)
-            chunk = ""
-        chunk += line + "\n"
-    if chunk:
-        await ctx.send(chunk)
-
-    await ctx.send("✅ 対応件数の出力が完了しました。")
-
-@bot.command(name="add")
-async def add_count(ctx):
-    await ctx.send("📊 加算処理を開始します...")  # 処理開始のメッセージ
-
-    sh = client.open_by_key("11MGwxoUOk2esCf-akJo2d3kSlLhV1rXsTwphuPn-HGI")
-    sheet4 = sh.worksheet("シート4")
-    sheet5 = sh.worksheet("シート5")
-
-    existing_data = sheet5.get_all_values()
-    if len(existing_data) == 0:
-        await ctx.send("⚠️ シート5にデータがありません。")
-        return
-    header = existing_data[0]
-    rows = existing_data[1:]
-
-    existing_dict = {}
-    for row in rows:
-        if len(row) < 6:
+        timestamp = datetime.strptime(time_str, "%Y/%m/%d %H:%M").replace(tzinfo=JST)
+        if not (start <= timestamp <= end):
             continue
-        name = row[0]
-        small_count = int(row[1]) if row[1].isdigit() else 0
-        small_arrest = int(row[2]) if row[2].isdigit() else 0
-        midplus_count = int(row[3]) if row[3].isdigit() else 0
-        midplus_arrest = int(row[4]) if row[4].isdigit() else 0
-        tickets = int(row[5]) if row[5].isdigit() else 0
-        existing_dict[name] = [small_count, small_arrest, midplus_count, midplus_arrest, tickets]
 
-    new_data = sheet4.get_all_values()[1:]
-    for row in new_data:
-        if len(row) < 6:
-            continue
+        participants = participants_str.split(",")
+
+        for user_id in participants:
+            if user_filter and user_id != user_filter:
+                continue
+
+            if user_id not in stats:
+                stats[user_id] = {"s_count": 0, "s_win": 0, "m_count": 0, "m_win": 0}
+
+            if category == "小型強盗":
+                stats[user_id]["s_count"] += 1
+                if result == "⭕":
+                    stats[user_id]["s_win"] += 1
+            else:
+                stats[user_id]["m_count"] += 1
+                if result == "⭕":
+                    stats[user_id]["m_win"] += 1
+
+    output_rows = []
+    for user_id, data in stats.items():
+        s_count = data["s_count"]
+        s_win = data["s_win"]
+        m_count = data["m_count"]
+        m_win = data["m_win"]
+        tickets = 0  # この時点ではチケットを固定（後のコマンドで加算）
+
+        display_name = user_id_map.get(user_id, user_id)
+
+        output_rows.append([
+            display_name,
+            s_count,
+            s_win,
+            m_count,
+            m_win,
+            tickets
+        ])
+
+    if output_rows:
+        sheet4.append_rows(output_rows)
+        await ctx.send("✅ count 処理が完了しました！")
+    else:
+        await ctx.send("⚠️ 指定条件に合致する対応データが見つかりません。")
+
+@bot.command()
+async def add(ctx):
+    await ctx.send("➕ add 処理を開始します...")
+
+    # シート4とシート5を取得
+    data4 = sheet4.get_all_values()[1:]  # ヘッダー除外
+    data5 = sheet5.get_all_values()
+    header = data5[0] if data5 else ['名前', '小型対応件数', '小型検挙数', '中型以上対応件数', '中型以上検挙数', 'チケット枚数']
+    existing_rows = data5[1:] if len(data5) > 1 else []
+
+    # 加算前データを保存しておく
+    pre_values_dict = {}
+    for row in existing_rows:
         name = row[0]
-        small_count = int(row[1]) if row[1].isdigit() else 0
-        small_arrest = int(row[2]) if row[2].isdigit() else 0
-        midplus_count = int(row[3]) if row[3].isdigit() else 0
-        midplus_arrest = int(row[4]) if row[4].isdigit() else 0
-        tickets = int(row[5]) if row[5].isdigit() else 0
+        values = [int(x) if x.isdigit() else 0 for x in row[1:6]]
+        pre_values_dict[name] = values
+
+    # 既存データを辞書に変換
+    existing_dict = dict(pre_values_dict)
+
+    # シート4から加算
+    for row in data4:
+        name = row[0]
+        values = [int(x) if x.isdigit() else 0 for x in row[1:6]]
 
         if name in existing_dict:
-            existing_dict[name][0] += small_count
-            existing_dict[name][1] += small_arrest
-            existing_dict[name][2] += midplus_count
-            existing_dict[name][3] += midplus_arrest
-            existing_dict[name][4] += tickets
+            existing_dict[name] = [a + b for a, b in zip(existing_dict[name], values)]
         else:
-            existing_dict[name] = [small_count, small_arrest, midplus_count, midplus_arrest, tickets]
+            existing_dict[name] = values
 
-    output_data = []
-    existing_names = [row[0] for row in rows]
+    # 出力用リストを整形
+    updated_rows = []
+    for name, values in existing_dict.items():
+        updated_rows.append([name] + values)
 
-    for name in existing_names:
-        counts = existing_dict.get(name, [0,0,0,0,0])
-        output_data.append([name] + counts)
+    # シート5を更新
+    sheet5.clear()
+    sheet5.update([header] + updated_rows, 'A1')
 
-    new_names = [n for n in existing_dict.keys() if n not in existing_names]
-    for name in new_names:
-        counts = existing_dict[name]
-        output_data.append([name] + counts)
+    # 結果出力用メッセージ生成
+    messages = []
+    for name, values in existing_dict.items():
+        s_count, s_win, m_count, m_win, _ = values
+        msg = f"◯ {name}\n　小型：対応{s_count}件 / 検挙{s_win}件\n　中型以上：対応{m_count}件 / 検挙{m_win}件"
+        messages.append(msg)
 
-    sheet5.update(f'A2', output_data)
+    # 初めて基準を超えた人だけ抽出
+    over_s = []
+    over_m = []
 
-    msg_lines = []
-    for name, counts in existing_dict.items():
-        small = counts[0]
-        midplus = counts[2]
-        tickets = counts[4]
-        msg_lines.append(f"◯ {name}\n　小型：{small}件\n　中型以上：{midplus}件\n　チケット：{tickets}枚")
+    for name, values in existing_dict.items():
+        s_win = values[1]
+        m_win = values[3]
+        s_win_prev = pre_values_dict.get(name, [0, 0, 0, 0])[1]
+        m_win_prev = pre_values_dict.get(name, [0, 0, 0, 0])[3]
 
-    MAX_LEN = 2000
+        if s_win >= 100 and s_win_prev < 100:
+            over_s.append(name)
+        if m_win >= 50 and m_win_prev < 50:
+            over_m.append(name)
+
+    # メッセージ分割送信
     chunk = ""
-    for line in msg_lines:
-        if len(chunk) + len(line) + 1 > MAX_LEN:
+    for msg in messages:
+        if len(chunk) + len(msg) + 1 > 1900:
             await ctx.send(chunk)
             chunk = ""
-        chunk += line + "\n"
+        chunk += msg + "\n"
     if chunk:
         await ctx.send(chunk)
 
-    await ctx.send("✅ シート5への加算処理が完了しました。")
+    # 通知送信（今回初めて基準を超えた人に限定）
+    for name in over_s:
+        await ctx.send(f"🎉 {name} の小型犯罪検挙数が100件を超えました！")
+    for name in over_m:
+        await ctx.send(f"🎉 {name} の中型以上犯罪検挙数が50件を超えました！")
+
+    await ctx.send("✅ add 処理が完了しました。")
 
 @bot.command()
 async def get_ticket(ctx):
-    await ctx.send("🔍 チケット獲得者の確認を開始します…")
+    await ctx.send("🎫 チケット付与処理を開始します...")
 
-    sh = client.open_by_key("11MGwxoUOk2esCf-akJo2d3kSlLhV1rXsTwphuPn-HGI")
-    sheet4 = sh.worksheet("シート4")
-    data = sheet4.get_all_values()
+    data4 = sheet4.get_all_values()[1:]  # ヘッダー除外
 
-    if len(data) <= 1:
-        await ctx.send("データがありません。")
-        await ctx.send("✅ 処理を終了しました。")
+    if not data4:
+        await ctx.send("⚠️ シート4にデータがありません。")
         return
 
-    rows = data[1:]
-    has_ticket = False
-    for row in rows:
+    updated_rows = [['名前', '小型対応件数', '小型検挙数', '中型以上対応件数', '中型以上検挙数', 'チケット枚数']]
+    ticket_messages = []
+
+    # シート5の既存データ取得
+    data5 = sheet5.get_all_values()[1:]  # ヘッダー除く
+    sheet5_dict = {}
+    for row in data5:
         if len(row) < 6:
             continue
         name = row[0]
-        try:
-            tickets = int(row[5])
-        except ValueError:
-            tickets = 0
+        tickets = int(str(row[5])) if str(row[5]).isdigit() else 0
+        sheet5_dict[name] = row[:5] + [tickets]  # 名前～検挙数＋チケット数
 
-        if tickets > 0:
-            has_ticket = True
-            await ctx.send(f"{name}：{tickets}枚")
-
-    if not has_ticket:
-        await ctx.send("チケットを獲得した人はいません。")
-
-    await ctx.send("✅ 処理を終了しました。")
-
-@bot.command()
-async def have_ticket(ctx):
-    await ctx.send("🎫 チケット所持者の確認を開始します…")
-
-    sh = client.open_by_key("11MGwxoUOk2esCf-akJo2d3kSlLhV1rXsTwphuPn-HGI")
-    sheet5 = sh.worksheet("シート5")
-    data = sheet5.get_all_values()
-
-    if len(data) <= 1:
-        await ctx.send("データがありません。")
-        await ctx.send("✅ 処理を終了しました。")
-        return
-
-    rows = data[1:]
-    result = []
-    for row in rows:
-        if len(row) < 6:
-            continue
+    for row in data4:
         name = row[0]
-        try:
-            tickets = int(row[5])
-        except ValueError:
-            tickets = 0
+        s_count = int(str(row[1])) if str(row[1]).isdigit() else 0
+        s_win   = int(str(row[2])) if str(row[2]).isdigit() else 0
+        m_count = int(str(row[3])) if str(row[3]).isdigit() else 0
+        m_win   = int(str(row[4])) if str(row[4]).isdigit() else 0
 
-        if tickets > 0:
-            result.append(f"{name}：{tickets}枚")
+        ticket = s_count // 20 + m_count // 10
+        updated_rows.append([name, s_count, s_win, m_count, m_win, ticket])
 
-    if not result:
-        await ctx.send("チケットを所持している人はいません。")
+        if ticket > 0:
+            ticket_messages.append(f"{name}：{ticket}枚")
+
+        # シート5へチケット加算
+        if name in sheet5_dict:
+            prev_tickets = int(str(sheet5_dict[name][5])) if str(sheet5_dict[name][5]).isdigit() else 0
+            new_tickets = prev_tickets + ticket
+            sheet5_dict[name][5] = str(new_tickets)
+        else:
+            # 新規ユーザーは0件データ＋チケット数だけセット（対応数等は0で埋める）
+            sheet5_dict[name] = [name, '0', '0', '0', '0', str(ticket)]
+
+    # シート5更新用データ準備
+    output_sheet5 = [['名前', '小型対応件数', '小型検挙数', '中型以上対応件数', '中型以上検挙数', 'チケット枚数']]
+    for v in sheet5_dict.values():
+        if len(v) < 6:
+            v += ['0'] * (6 - len(v))
+        output_sheet5.append(v)
+
+    # シート4を更新
+    sheet4.clear()
+    sheet4.update(updated_rows, 'A1')
+
+    # シート5を更新
+    sheet5.clear()
+    sheet5.update(output_sheet5, 'A1')
+
+    # 出力（1人ずつ）
+    if not ticket_messages:
+        await ctx.send("⚠️ チケットを獲得したユーザーはいません。")
     else:
-        await ctx.send("\n".join(result))
+        for msg in ticket_messages:
+            await ctx.send(msg)
 
-    await ctx.send("✅ 処理を終了しました。")
-
-@bot.command()
-async def use_ticket(ctx, user_id: str, num: int):
-    await ctx.send(f"🛠️ ユーザーID {user_id} のチケットを {num} 枚減算しようとしています…")
-
-    sh = gc.open_by_key("シート5")
-    sheet5 = sh.worksheet("シート5")
-    data = sheet5.get_all_values()
-    header = data[0]
-    rows = data[1:]
-
-    user_id_index = 1
-    ticket_index = 5
-
-    row_number = None
-    current_tickets = 0
-    for i, row in enumerate(rows, start=2):
-        if len(row) <= max(user_id_index, ticket_index):
-            continue
-        if row[user_id_index] == user_id:
-            row_number = i
-            try:
-                current_tickets = int(row[ticket_index])
-            except ValueError:
-                current_tickets = 0
-            break
-
-    if row_number is None:
-        await ctx.send(f"ユーザーID {user_id} は見つかりません。")
-        await ctx.send("❌ 処理を中止しました。")
-        return
-
-    if current_tickets < num:
-        await ctx.send(f"ユーザーID {user_id} のチケットは {current_tickets} 枚しかありません。減算できません。")
-        await ctx.send("❌ 処理を中止しました。")
-        return
-
-    new_tickets = current_tickets - num
-    sheet5.update_cell(row_number, ticket_index + 1, str(new_tickets))
-
-    await ctx.send(f"✅ ユーザーID {user_id} のチケットを {num} 枚減算しました。残り {new_tickets} 枚です。")
-    await ctx.send("✅ 処理を終了しました。")
+    await ctx.send("✅ チケット処理が完了しました。")
 
 @bot.command()
 async def rate(ctx, start_date: str, end_date: str):
-    data = sheet6.get_all_values("シート6")  # ← ここで sheet6 を直接使えばOK
+    await ctx.send("📊 勝率集計を開始します…")
+
+    try:
+        start_dt = datetime.strptime(start_date, "%Y/%m/%d")
+        end_dt = datetime.strptime(end_date, "%Y/%m/%d")
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+    except Exception:
+        await ctx.send("⚠️ 日付の形式が正しくありません。例: 2025/06/01")
+        return
+
+    data = sheet2.get_all_values()
+    if len(data) < 2:
+        await ctx.send("⚠️ シート2にデータがありません。")
+        return
+
     header = data[0]
     rows = data[1:]
 
-    # 日付の範囲をdatetime.dateに変換
-    start_dt = datetime.strptime(start_date, "%Y/%m/%d").date()
-    end_dt = datetime.strptime(end_date, "%Y/%m/%d").date()
+    # 集計用辞書 {crime_name: {"category": ..., "total": ..., "win": ...}}
+    rate_data = {}
 
-    # 逆転していたら入れ替え
-    if start_dt > end_dt:
-        start_dt, end_dt = end_dt, start_dt
-
-    results = []
-
-    period_index = 0
-    crime_type_index = 1
-    crime_category_index = 2
-    case_count_index = 3
-    success_count_index = 4
-    rate_index = 5
-
+    # 日付の範囲判定用に、メッセージ日時をdatetimeに変換しながら集計
     for row in rows:
-        period_str = row[period_index]
         try:
-            period_dt = datetime.strptime(period_str, "%Y/%m/%d").date()
+            dt = datetime.strptime(row[0], "%Y/%m/%d %H:%M")
         except Exception:
             continue
 
-        if start_dt <= period_dt <= end_dt:
-            crime_name = row[crime_type_index]
-            crime_cat = row[crime_category_index]
-            case_num = row[case_count_index]
-            success_num = row[success_count_index]
-            win_rate = row[rate_index]
+        if not (start_dt <= dt <= end_dt):
+            continue
 
-            results.append(f"{crime_name} ({crime_cat}): 勝率 {win_rate}% (事件数: {case_num}, 検挙数: {success_num})")
+        crime_name = row[1]
+        crime_cat = row[2]
+        arrest = row[4]  # ⭕ or ❌
 
-    if not results:
-        await ctx.send("指定期間に該当する勝率データはありません。")
+        if crime_name not in rate_data:
+            rate_data[crime_name] = {"category": crime_cat, "total": 0, "win": 0}
+        rate_data[crime_name]["total"] += 1
+        if arrest == "⭕":
+            rate_data[crime_name]["win"] += 1
+
+    if not rate_data:
+        await ctx.send("指定期間に該当するデータがありません。")
         return
 
-    # 送信メッセージを分割（2000文字制限対策）
+    # カテゴリごとに整理
+    categories = {
+        "小型強盗": [],
+        "中型強盗": [],
+        "大型強盗": []
+    }
+    for crime, stats in rate_data.items():
+        categories.get(stats["category"], []).append(
+            (crime, stats["win"], stats["total"])
+        )
+
+    # メッセージ作成
+    lines = []
+    for cat_name in ["小型強盗", "中型強盗", "大型強盗"]:
+        crimes = categories.get(cat_name, [])
+        if not crimes:
+            continue
+        lines.append(f"■ {cat_name}")
+        for crime, win, total in crimes:
+            rate = (win / total) * 100 if total > 0 else 0
+            lines.append(f"・{crime} : {rate:.1f}% ({total}件中 {win}件成功)")
+        lines.append("")
+
+    # 2000文字制限を考慮して分割送信
     message = ""
-    for line in results:
+    for line in lines:
         if len(message) + len(line) + 1 > 1900:
             await ctx.send(message)
             message = ""
@@ -516,5 +560,6 @@ async def rate(ctx, start_date: str, end_date: str):
     if message:
         await ctx.send(message)
 
-# Botトークンは環境変数から取得（安全のため）
+    await ctx.send("✅ 勝率集計が完了しました。")
+
 bot.run(os.getenv("DISCORD_TOKEN"))
